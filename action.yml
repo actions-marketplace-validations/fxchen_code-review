@@ -6,25 +6,40 @@ inputs:
     description: 'The token used to authenticate with the GitHub API'
     required: false
     default: ${{ github.token }}
-  model: 
-    description: 'The OpenAI language model to use for code review'
+  api-to-use:
+    description: 'The API to use for code review (openai, claude)'
     required: false
-    default: 'gpt-3.5-turbo'
+    default: 'openai'
+  openai-key:
+    description: 'The OpenAI API key'
+    required: true
+  anthropic-key:
+    description: 'The Anthropic (Claude) API key'
+    required: false
+  model: 
+    description: 'The OpenAI or Anthropic language model to use for code review'
+    required: false
+    default: 'gpt-3.5-turbo-16k'
   persona:
     description: 'The persona to use in the prompt (developer, kent_beck, marc_benioff, yoda)'
     required: false
-    default: 'developer'
+    default: 'kent_beck'
   style:
     description: 'The style of output to use (concise, zen)'
     required: false
     default: 'concise'
-  openai-key:
-    description: 'The OpenAI API key'
-    required: true
+  include-full-files:
+    description: 'Whether to include full files in addition to the diff (true or false)'
+    required: false
+    default: 'false'
   post-if-error:
     description: 'Whether to post a comment if there was an error'
     required: false
-    default: 'true'
+    default: 'false'
+  exclude-files:
+    description: 'A list of flags to exclude from the action (comma separated). E.g. "package.json,pyproject.toml"'
+    required: false
+    default: ''
 
 outputs:
   results:
@@ -33,12 +48,11 @@ outputs:
 runs:
   using: 'composite'
   steps:
-
     - name: Checkout
       uses: actions/checkout@v2
       with:
-        fetch-depth: 2
-        
+        fetch-depth: 0
+
     - name: Install Python
       uses: actions/setup-python@v4
       with:
@@ -47,23 +61,61 @@ runs:
     - name: Install Dependencies
       run: pip install -r ${{ github.action_path }}/requirements.txt
       shell: bash
+    - name: Get common ancestor for branch point
+      id: first_commit
+      run: |
+        # Find the common ancestor of the base branch and the head branch
+        common_ancestor=$(git merge-base ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }})
+        echo "sha=$common_ancestor" >> $GITHUB_OUTPUT
+      shell: bash
 
+    - name: Prepare excluded files
+      id: prepare_exclude
+      run: |
+        exclude_flags=${{ inputs.exclude-files }}
+        IFS=', ' read -r -a exclude_array <<< "$exclude_flags"
+        exclude_str=""
+        for index in "${!exclude_array[@]}"
+        do
+            exclude_str+="':!${exclude_array[index]}' "
+        done
+        echo "exclude_files=$exclude_str" >> $GITHUB_OUTPUT
+      shell: bash
+    
+    - name: Run git diff
+      id: git_diff
+      run: |
+        source $GITHUB_OUTPUT
+        git diff --merge-base ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} -- . ${{ steps.prepare_exclude.outputs.exclude_files }} > diff.txt
+      shell: bash
+    - name: Get git diff
+      id: print_diff
+      run: |
+        echo "::set-output name=diff::$(cat diff.txt)"
+      shell: bash
+    - name: Print diff 
+      run: echo "${{ steps.print_diff.outputs.diff }}"
+      shell: bash
     - name: Run OpenAI code review
       id: openai
       run: |
-        git diff ${{ github.event.pull_request.base.sha }} ${{ github.event.pull_request.head.sha }} | python ${{ github.action_path }}/action_code_review.py > review.txt
+        cat diff.txt | python ${{ github.action_path }}/action_code_review.py > review.txt
         echo 'reviewresult<<EOF' >> $GITHUB_OUTPUT
         echo "$(cat review.txt)" >> $GITHUB_OUTPUT
         echo 'EOF' >> $GITHUB_OUTPUT
       shell: bash
       env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        API_TO_USE: ${{ inputs.api-to-use }}
         OPENAI_API_KEY: ${{ inputs.openai-key }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-key }}
         MODEL: ${{ inputs.model }}
         PERSONA: ${{ inputs.persona }}
         STYLE: ${{ inputs.style }}
-        GITHUB_TOKEN: ${{ inputs.github-token }}
+        INCLUDE_FILES: ${{ inputs.include-full-files }}
         COMMIT_TITLE: ${{ github.event.pull_request.title }}
         COMMIT_BODY: ${{ github.event.pull_request.body }}
+
     - name: Show output in case of failure
       id: err-output
       if: failure()
@@ -80,8 +132,8 @@ runs:
       with:
         issue-number: ${{ github.event.pull_request.number }}
         body: |
+          # Review:
           ${{ steps.openai.outputs.reviewresult && steps.openai.outputs.reviewresult || steps.err-output.outputs.errorresult }}
-        reactions: '+1'
 
 branding:
   icon: 'user-check'
